@@ -1,0 +1,231 @@
+name: 自动部署到服务器
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+      
+      - name: 配置SSH密钥
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+      
+      - name: 连接服务器并部署
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            set -e
+            
+            echo "=========================================="
+            echo "开始自动部署 - $(date)"
+            echo "=========================================="
+            
+            # 进入项目目录
+            cd /opt/wujishi-system
+            
+            # 如果目录不存在，先初始化
+            if [ ! -d ".git" ]; then
+                echo "首次部署，初始化项目..."
+                git clone https://github.com/wst3050469/jinmo.git temp
+                mv temp/.git .
+                rm -rf temp
+                git reset --hard HEAD
+            fi
+            
+            # 拉取最新代码
+            echo "拉取最新代码..."
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # 检查环境
+            if ! command -v java &> /dev/null; then
+                echo "安装Java..."
+                yum install -y java-17-openjdk java-17-openjdk-devel
+            fi
+            
+            if ! command -v mvn &> /dev/null; then
+                echo "安装Maven..."
+                cd /usr/local/src
+                wget -q https://archive.apache.org/dist/maven/maven-3/3.9.6/binaries/apache-maven-3.9.6-bin.tar.gz
+                tar -xzf apache-maven-3.9.6-bin.tar.gz
+                mv apache-maven-3.9.6 /usr/local/maven
+                echo 'export MAVEN_HOME=/usr/local/maven' >> /etc/profile
+                echo 'export PATH=$MAVEN_HOME/bin:$PATH' >> /etc/profile
+                source /etc/profile
+            fi
+            
+            if ! command -v npm &> /dev/null; then
+                echo "安装Node.js..."
+                cd /usr/local/src
+                wget -q https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz
+                tar -xf node-v20.11.1-linux-x64.tar.xz
+                mv node-v20.11.1-linux-x64 /usr/local/node
+                echo 'export NODE_HOME=/usr/local/node' >> /etc/profile
+                echo 'export PATH=$NODE_HOME/bin:$PATH' >> /etc/profile
+                source /etc/profile
+                npm config set registry https://registry.npmmirror.com
+            fi
+            
+            # 加载环境变量
+            source /etc/profile
+            
+            # 编译后端
+            echo "编译后端..."
+            cd /opt/wujishi-system/backend
+            mkdir -p src/main/resources src/main/java/com/wujishi/system/controller
+            
+            # 写入配置文件
+            cat > src/main/resources/application.yml << 'EOF'
+            server:
+              port: 8080
+              servlet:
+                context-path: /api
+
+            spring:
+              application:
+                name: wujishi-system
+
+              datasource:
+                url: jdbc:postgresql://pgm-2vcr8hvus9t2t979.pgsql.cn-chengdu.rds.aliyuncs.com:5432/wujishi_system
+                username: jinmo_admin
+                password: liu201314!@#
+                driver-class-name: org.postgresql.Driver
+
+              jpa:
+                hibernate:
+                  ddl-auto: update
+                show-sql: true
+
+            logging:
+              level:
+                root: INFO
+                com.wujishi: DEBUG
+              file:
+                name: logs/application.log
+            EOF
+            
+            # 写入Java文件
+            cat > src/main/java/com/wujishi/system/WujishiSystemApplication.java << 'EOF'
+            package com.wujishi.system;
+
+            import org.springframework.boot.SpringApplication;
+            import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+            @SpringBootApplication
+            public class WujishiSystemApplication {
+                public static void main(String[] args) {
+                    SpringApplication.run(WujishiSystemApplication.class, args);
+                }
+            }
+            EOF
+            
+            cat > src/main/java/com/wujishi/system/controller/HealthController.java << 'EOF'
+            package com.wujishi.system.controller;
+
+            import org.springframework.web.bind.annotation.GetMapping;
+            import org.springframework.web.bind.annotation.RestController;
+            import java.util.HashMap;
+            import java.util.Map;
+
+            @RestController
+            public class HealthController {
+                @GetMapping("/health")
+                public Map<String, Object> health() {
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("status", "OK");
+                    result.put("message", "无机磨石企业管理系统运行正常");
+                    result.put("timestamp", System.currentTimeMillis());
+                    return result;
+                }
+            }
+            EOF
+            
+            # 编译
+            if [ -f "pom.xml" ]; then
+                mvn clean package -DskipTests
+            fi
+            
+            # 编译前端
+            echo "编译前端..."
+            cd /opt/wujishi-system/frontend
+            
+            if [ ! -f "package.json" ]; then
+                cat > package.json << 'EOF'
+            {
+              "name": "wujishi-frontend",
+              "version": "1.0.0",
+              "type": "module",
+              "scripts": {
+                "dev": "vite",
+                "build": "vite build",
+                "preview": "vite preview"
+              },
+              "dependencies": {
+                "vue": "^3.4.0",
+                "element-plus": "^2.5.0"
+              },
+              "devDependencies": {
+                "@vitejs/plugin-vue": "^5.0.0",
+                "vite": "^5.0.0"
+              }
+            }
+            EOF
+            fi
+            
+            if [ ! -d "node_modules" ]; then
+                npm install
+            fi
+            npm run build
+            
+            # 重启后端
+            echo "重启后端..."
+            cd /opt/wujishi-system
+            pkill -f "wujishi-system.jar" || true
+            sleep 2
+            
+            if [ -f "backend/target/wujishi-system-1.0.0.jar" ]; then
+                nohup java -jar backend/target/wujishi-system-1.0.0.jar > backend/logs/application.log 2>&1 &
+                echo $! > backend.pid
+            fi
+            
+            # 配置Nginx
+            echo "配置Nginx..."
+            cat > /etc/nginx/conf.d/wujishi-system.conf << 'EOF'
+            server {
+                listen 80;
+                server_name 8.139.6.153;
+
+                location / {
+                    root /opt/wujishi-system/frontend/dist;
+                    index index.html;
+                    try_files $uri $uri/ /index.html;
+                }
+
+                location /api/ {
+                    proxy_pass http://127.0.0.1:8080;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                }
+            }
+            EOF
+            
+            nginx -t && nginx -s reload
+            
+            echo ""
+            echo "=========================================="
+            echo "✅ 自动部署完成！"
+            echo "=========================================="
+            echo "时间: $(date)"
+            echo "访问地址: http://8.139.6.153"
+            echo "=========================================="
+          ENDSSH
